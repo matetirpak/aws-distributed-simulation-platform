@@ -1,0 +1,222 @@
+# Weekday drift detection: a refresh-only plan of every environment from main
+# with the read-only plan role (reports only changes made outside Terraform),
+# keeping one "Drift detected: <env>" issue in sync with the result.
+name: drift
+
+on:
+  schedule:
+    # 05:00 CET = 04:00 UTC (06:00 in summer, when Berlin is on CEST).
+    # Top-of-hour schedules can be delayed under load; see docs/ci-cd.md.
+    - cron: "0 4 * * 1-5"
+  workflow_dispatch: {}
+
+permissions: {}
+
+# One drift run at a time, so two runs never race on the same issue. The detect
+# jobs also join terraform-<env>, shared with deploy plans and applies.
+concurrency:
+  group: drift
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  envs:
+    name: discover environments
+    # Only once an AWS account is configured (an INFRA_<ENV> repository variable, docs/ci-cd.md).
+    # detect and report are skipped with this job.
+    if: contains(toJSON(vars), '"INFRA_')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      envs: ${{ steps.discover.outputs.envs }}
+    steps:
+      - name: Only main is checked for drift
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::drift detection only runs from main (this run is on $GITHUB_REF)."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: discover
+        run: .github/scripts/discover.sh
+
+  detect:
+    name: detect (${{ matrix.env }})
+    needs: envs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: terraform-${{ matrix.env }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token to assume the read-only plan role
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.envs.outputs.envs) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read ci.json
+        id: cfg
+        env:
+          TF_ENV: ${{ matrix.env }}
+          CI_VARS: ${{ toJSON(vars) }}
+        run: .github/scripts/read-ci-config.sh "$TF_ENV" plan_role_arn
+
+      - uses: ./.github/actions/setup-terraform
+
+      - name: Assume the read-only plan role
+        id: creds
+        # A failure here must still produce a ❌ comment/summary: tf-plan.sh
+        # renders it, and the last step fails the job.
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+          allowed-account-ids: ${{ steps.cfg.outputs.account }}
+          role-session-name: gha-drift-${{ github.run_id }}
+
+      - name: terraform plan -refresh-only
+        id: plan
+        env:
+          TF_ENV: ${{ matrix.env }}
+          OUT_DIR: ${{ runner.temp }}/plan
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MARKER_NAME: terraform-drift
+          # Only changes made outside Terraform; merged-but-unapproved changes are not drift.
+          PLAN_MODE: refresh-only
+          ASSUME_ROLE_OUTCOME: ${{ steps.creds.outcome }}
+          PLAN_ROLE: ${{ steps.cfg.outputs.role }}
+        run: .github/scripts/tf-plan.sh
+
+      - name: Write plan to the job summary
+        env:
+          OUT_DIR: ${{ runner.temp }}/plan
+        run: cat "$OUT_DIR/summary.md" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result for the report job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: drift-${{ matrix.env }}
+          path: |
+            ${{ runner.temp }}/plan/comment.md
+            ${{ runner.temp }}/plan/exitcode
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Fail if the plan failed
+        env:
+          EXITCODE: ${{ steps.plan.outputs.exitcode }}
+        run: |
+          if [[ "$EXITCODE" != 0 && "$EXITCODE" != 2 ]]; then
+            echo "::error::terraform plan failed (exit code $EXITCODE); drift could not be checked."
+            exit 1
+          fi
+
+  report:
+    name: report
+    needs: detect
+    if: ${{ !cancelled() && (needs.detect.result == 'success' || needs.detect.result == 'failure') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # No AWS credentials here; this job only maintains the drift issues.
+    permissions:
+      contents: read
+      issues: write # open, update and close "Drift detected: <env>" issues
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: drift-*
+          path: ${{ runner.temp }}/drift
+
+      - name: Sync drift issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRIFT_DIR: ${{ runner.temp }}/drift
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          source .github/scripts/gh-retry.sh
+          # download-artifact extracts a single matching artifact directly into
+          # DRIFT_DIR and several into sub-directories, so search recursively and
+          # take the environment from the rendered file's marker line.
+          marker_re='^<!-- terraform-drift:([a-z0-9-]+) -->$'
+          mapfile -t results < <(find "$DRIFT_DIR" -type f -name exitcode | sort)
+          ((${#results[@]} > 0)) || { echo "::error::No drift results were downloaded."; exit 1; }
+          for result in "${results[@]}"; do
+            dir=$(dirname "$result")
+            [[ "$(head -n 1 "$dir/comment.md")" =~ $marker_re ]] || { echo "::error::Unexpected drift result in $dir"; exit 1; }
+            env_name=${BASH_REMATCH[1]}
+            exitcode=$(<"$dir/exitcode")
+            title="Drift detected: $env_name"
+            # Match on the exact title (not the label), so an issue opened without
+            # the label (label missing) is still found and updated.
+            find_issue() {
+              gh_retry issue list --state open --limit 200 --json number,title |
+                jq -r --arg t "$title" '[.[] | select(.title == $t)] | first | .number // empty'
+            }
+            existing=$(find_issue)
+
+            case "$exitcode" in
+              2)
+                body="$RUNNER_TEMP/drift-$env_name.md"
+                {
+                  cat "$dir/comment.md"
+                  echo
+                  echo "Found by the [drift workflow run]($RUN_URL). Fix it by reverting the manual change, or codify it in a PR."
+                } >"$body"
+                if [[ -n "$existing" ]]; then
+                  gh_retry issue edit "$existing" --body-file "$body" >/dev/null
+                  echo "Updated #$existing ($title)"
+                else
+                  label_args=(--label drift)
+                  if ! label_exists drift; then
+                    echo "::warning::Label 'drift' does not exist (create it, see docs/setup.md); opening the issue without it."
+                    label_args=()
+                  fi
+                  # A failed find fails the attempt rather than counting as "no issue yet".
+                  open_issue() {
+                    local found
+                    found=$(find_issue) || return 1
+                    [[ -z "$found" ]] || return 0
+                    gh issue create --title "$title" "${label_args[@]}" --body-file "$body"
+                  }
+                  retry_step open_issue
+                  echo "Opened issue: $title"
+                fi
+                ;;
+              0)
+                if [[ -n "$existing" ]]; then
+                  gh_retry issue close "$existing" --comment "No drift in $env_name as of [this run]($RUN_URL). Closing." >/dev/null
+                  echo "Closed #$existing ($title)"
+                else
+                  echo "No drift in $env_name."
+                fi
+                ;;
+              *)
+                echo "::warning::Plan for $env_name failed (exit code $exitcode); drift issue left unchanged."
+                ;;
+            esac
+          done

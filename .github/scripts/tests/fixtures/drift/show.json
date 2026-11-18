@@ -1,0 +1,21 @@
+{
+  "resource_changes": [],
+  "resource_drift": [
+    {
+      "address": "local_file.kept",
+      "change": {
+        "actions": [
+          "update"
+        ]
+      }
+    },
+    {
+      "address": "local_file.vanished",
+      "change": {
+        "actions": [
+          "delete"
+        ]
+      }
+    }
+  ]
+}

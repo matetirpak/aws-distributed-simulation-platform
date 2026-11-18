@@ -1,0 +1,8 @@
+{
+  "account_id": "123456789012",
+  "github_repository": "OWNER/NAME",
+  "github_repository_id": "1000001",
+  "github_repository_owner_id": "2000002",
+  "github_oidc_subject_prefix": "repo:OWNER@2000002/NAME@1000001",
+  "approver_actor_ids": ["3000003"]
+}

@@ -1,0 +1,7 @@
+.git
+.github
+target
+out
+# The builder image already ships the pinned Rust version; with this file present,
+# rustup would try to download the extra components and targets during the build.
+rust-toolchain.toml

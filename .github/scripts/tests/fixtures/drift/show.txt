@@ -1,0 +1,32 @@
+
+Note: Objects have changed outside of Terraform
+
+Terraform detected the following changes made outside of Terraform since the
+last "terraform apply" which may have affected this plan:
+
+  # local_file.kept has changed
+  ~ resource "local_file" "kept" {
+        id                   = "ff3390557335ba88d37755e41514beb03bc499ec"
+        # (10 unchanged attributes hidden)
+    }
+
+  # local_file.vanished has been deleted
+  - resource "local_file" "vanished" {
+      - content              = "gone" -> null
+      - content_base64sha256 = "KDu53u8C5oQ6v7U476HspwgBvYpwHD+YGR4SNJYzkkc=" -> null
+      - content_base64sha512 = "BNZ84AMIQKUeMkjF/yH0RBh/FmaU1EQ54I7eeDOxrcCxoSYp5pPwy3kEGPTUcB61cmSI+Ooj7Ye9fKVFnLEfRg==" -> null
+      - content_md5          = "50c1f58be7f5e47e0f53d64c094783c2" -> null
+      - content_sha1         = "a6dfdeaa3a44a4c52d44284847d7160892b4017e" -> null
+      - content_sha256       = "283bb9deef02e6843abfb538efa1eca70801bd8a701c3f98191e123496339247" -> null
+      - content_sha512       = "04d67ce0030840a51e3248c5ff21f444187f166694d44439e08ede7833b1adc0b1a12629e693f0cb790418f4d4701eb5726488f8ea23ed87bd7ca5459cb11f46" -> null
+      - directory_permission = "0777" -> null
+      - file_permission      = "0777" -> null
+      - filename             = "./vanished.txt" -> null
+      - id                   = "a6dfdeaa3a44a4c52d44284847d7160892b4017e" -> null
+    }
+
+
+This is a refresh-only plan, so Terraform will not take any actions to undo
+these. If you were expecting these changes then you can apply this plan to
+record the updated values in the Terraform state without changing any remote
+objects.

@@ -1,0 +1,501 @@
+# PR checks, and the same checks on every push to main. `ci-result` is the only
+# status check the main ruleset requires; every other job reports into it. The
+# Terraform plan runs only on pull requests and only once an AWS account is
+# configured (an INFRA_<ENV> repository variable); the code checks never need AWS.
+# See docs/ci-cd.md.
+name: ci
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  push:
+    branches: [main]
+  # No `paths:` filter on purpose: a required check that never runs blocks merges
+  # forever. The `changes` job decides what is relevant instead.
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      infra: ${{ steps.diff.outputs.infra }}
+      platform: ${{ steps.diff.outputs.platform }}
+      workflows: ${{ steps.diff.outputs.workflows }}
+      envs: ${{ steps.discover.outputs.envs }}
+      roots: ${{ steps.discover.outputs.roots }}
+      is_fork: ${{ steps.diff.outputs.is_fork }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            # On main, check everything.
+            printf 'infra=true\nplatform=true\nworkflows=true\nis_fork=false\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          printf 'Changed files:\n%s\n' "$changed"
+          infra=false platform=false workflows=false is_fork=false
+          grep -qE '^(infra/|\.terraform-version$|\.tflint\.hcl$)' <<<"$changed" && infra=true
+          grep -qE '^platform/' <<<"$changed" && platform=true
+          grep -qE '^\.github/' <<<"$changed" && workflows=true
+          [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]] && is_fork=true
+          {
+            echo "infra=$infra"
+            echo "platform=$platform"
+            echo "workflows=$workflows"
+            echo "is_fork=$is_fork"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Discover environments and Terraform roots
+        id: discover
+        run: .github/scripts/discover.sh
+
+      - name: Lock files only in roots and tested modules
+        run: |
+          # A lock file in a plain module turns it into a "root" for CI and lets
+          # CI download whatever provider version it pins, however new. Modules
+          # don't need one: the root's lock pins providers.
+          bad=0
+          while read -r lock; do
+            dir=$(dirname "$lock")
+            if [[ "$dir" =~ ^infra/(envs|bootstrap)/[a-z0-9_-]+$ ]] || compgen -G "$dir/tests/*.tftest.hcl" >/dev/null; then
+              continue
+            fi
+            echo "::error file=$lock::Lock file outside a root. Remove it (the root's lock pins providers), or add tests/ if this module has Terraform tests."
+            bad=1
+          done < <(git ls-files 'infra/**/.terraform.lock.hcl')
+          exit "$bad"
+
+  fmt:
+    name: fmt
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-terraform
+      - run: terraform fmt -check -recursive -diff infra/
+
+  validate:
+    name: validate (${{ matrix.root }})
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        root: ${{ fromJSON(needs.changes.outputs.roots) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-terraform
+      - name: terraform init (no backend, lock file read-only)
+        env:
+          ROOT: ${{ matrix.root }}
+        run: terraform -chdir="$ROOT" init -backend=false -lockfile=readonly -input=false -no-color
+      - name: terraform validate
+        env:
+          ROOT: ${{ matrix.root }}
+        run: terraform -chdir="$ROOT" validate -no-color
+      - name: terraform test (offline tests, if any)
+        env:
+          ROOT: ${{ matrix.root }}
+        run: |
+          if compgen -G "$ROOT/tests/*.tftest.hcl" >/dev/null; then
+            terraform -chdir="$ROOT" test -no-color
+          else
+            echo "No tests in $ROOT"
+          fi
+
+  tflint:
+    name: tflint
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned tflint and aws ruleset
+        run: .github/scripts/install-tool.sh tflint tflint-ruleset-aws
+      - run: tflint --version --config "$GITHUB_WORKSPACE/.tflint.hcl"
+      - run: tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+
+  iac-scan:
+    name: iac-scan
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      # Report-only for now. Once the baseline is clean, set to "HIGH,CRITICAL"
+      # to fail the job on those severities (docs/ci-cd.md).
+      FAIL_ON_SEVERITY: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned trivy
+        run: .github/scripts/install-tool.sh trivy
+      - name: trivy config (embedded checks only, no runtime downloads)
+        run: |
+          args=(config --skip-check-update --cache-dir "$RUNNER_TEMP/trivy" --quiet)
+          trivy "${args[@]}" --format table --exit-code 0 infra/ | tee "$RUNNER_TEMP/trivy.txt"
+          {
+            echo "### IaC scan (trivy config)"
+            if [[ -n "$FAIL_ON_SEVERITY" ]]; then echo "Failing on: $FAIL_ON_SEVERITY"; else echo "Report-only mode."; fi
+            echo '```'
+            cat "$RUNNER_TEMP/trivy.txt"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [[ -n "$FAIL_ON_SEVERITY" ]]; then
+            trivy "${args[@]}" --severity "$FAIL_ON_SEVERITY" --exit-code 1 infra/ >/dev/null
+          fi
+
+  workflow-lint:
+    name: workflow-lint
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned actionlint, zizmor and shellcheck
+        id: tools
+        run: .github/scripts/install-tool.sh actionlint zizmor shellcheck
+      # Every linter runs even if an earlier one failed, so one run reports all
+      # findings. Any failure still fails the job.
+      - name: actionlint (uses the pinned shellcheck for run blocks)
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        run: actionlint -color
+      - name: zizmor (online audits)
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --format=github --persona=regular .
+      - name: shellcheck scripts
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        run: shellcheck -x .github/scripts/*.sh .github/scripts/tests/*.sh infra/envs/*/bot_host/*.sh platform/prototype/*.sh
+      - name: render-plan tests
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        run: bash .github/scripts/tests/render-plan.test.sh
+
+  plan:
+    name: plan (${{ matrix.env }})
+    needs: [changes, validate]
+    # validate is skipped when only workflows changed; plan should still run then.
+    # On main, deploy.yml plans instead. Without an AWS account there is nothing to plan.
+    if: >-
+      github.event_name == 'pull_request'
+      && contains(toJSON(vars), '"INFRA_')
+      && !cancelled()
+      && needs.changes.result == 'success'
+      && (needs.validate.result == 'success' || needs.validate.result == 'skipped')
+      && needs.changes.outputs.is_fork != 'true'
+      && (needs.changes.outputs.infra == 'true' || needs.changes.outputs.workflows == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # This job runs PR code with AWS credentials: it gets the read-only plan role
+    # and no permission to write to the PR. Commenting happens in `comment`.
+    permissions:
+      contents: read
+      id-token: write # OIDC token to assume the read-only plan role
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.changes.outputs.envs) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read ci.json
+        id: cfg
+        env:
+          TF_ENV: ${{ matrix.env }}
+          CI_VARS: ${{ toJSON(vars) }}
+        run: .github/scripts/read-ci-config.sh "$TF_ENV" plan_role_arn
+
+      - uses: ./.github/actions/setup-terraform
+
+      - name: Assume the read-only plan role
+        id: creds
+        # A failure here must still produce a ❌ comment/summary: tf-plan.sh
+        # renders it, and the last step fails the job.
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+          allowed-account-ids: ${{ steps.cfg.outputs.account }}
+          role-session-name: gha-pr-plan-${{ github.run_id }}
+
+      - name: terraform plan
+        id: plan
+        env:
+          TF_ENV: ${{ matrix.env }}
+          OUT_DIR: ${{ runner.temp }}/plan
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ASSUME_ROLE_OUTCOME: ${{ steps.creds.outcome }}
+          PLAN_ROLE: ${{ steps.cfg.outputs.role }}
+        run: .github/scripts/tf-plan.sh
+
+      - name: Write plan to the job summary
+        env:
+          OUT_DIR: ${{ runner.temp }}/plan
+        run: cat "$OUT_DIR/summary.md" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload rendered comment
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-comment-${{ matrix.env }}
+          path: ${{ runner.temp }}/plan/comment.md
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Fail if the plan failed
+        env:
+          EXITCODE: ${{ steps.plan.outputs.exitcode }}
+        run: |
+          if [[ "$EXITCODE" != 0 && "$EXITCODE" != 2 ]]; then
+            echo "::error::terraform plan failed (exit code $EXITCODE). See the job summary or PR comment."
+            exit 1
+          fi
+
+  comment:
+    name: comment
+    needs: [changes, plan]
+    if: >-
+      !cancelled()
+      && (needs.plan.result == 'success' || needs.plan.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # No AWS credentials here; this job only turns rendered files into comments.
+    permissions:
+      contents: read
+      pull-requests: write # create/update the sticky plan comments
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: plan-comment-*
+          path: ${{ runner.temp }}/comments
+
+      - name: Create or update one sticky comment per environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMENTS_DIR: ${{ runner.temp }}/comments
+        run: |
+          # download-artifact extracts a single matching artifact directly into
+          # COMMENTS_DIR and several into sub-directories, so search recursively.
+          # Each file carries its environment in its marker line.
+          mapfile -t files < <(find "$COMMENTS_DIR" -type f -name comment.md | sort)
+          if ((${#files[@]} == 0)); then
+            echo "::warning::No rendered plan comments found."
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            .github/scripts/upsert-comment.sh "$PR_NUMBER" "$f"
+          done
+
+  # The Rust workspace in platform/: the controller, relay, protocol, toy games, mock controller and local runner.
+  rust:
+    name: rust
+    needs: changes
+    if: needs.changes.outputs.platform == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: platform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust version from rust-toolchain.toml
+        id: toolchain
+        run: rustup toolchain install
+      # Every check runs even if an earlier one failed, so one run reports all findings.
+      - name: fmt
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo fmt --check
+      - name: clippy
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: tests (the protocol and relay tests run the real binaries over localhost)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: cargo test --workspace --locked
+
+  # platform/Cargo.toml promises `rust-version = "1.98"`, the oldest Rust the game server builds with.
+  minimum-rust:
+    name: minimum-rust
+    needs: changes
+    if: needs.changes.outputs.platform == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: platform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.98.1
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Build everything, tests included, with 1.98.1
+        run: cargo +1.98.1 check --workspace --all-targets --locked
+
+  # The dispatcher (strict), and the prototype's runner, match task and bots (platform/ruff.toml).
+  # The dispatcher's docker end-to-end test runs locally.
+  python:
+    name: python
+    needs: changes
+    if: needs.changes.outputs.platform == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: platform/dispatcher
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned uv
+        run: ../../.github/scripts/install-tool.sh uv
+      - name: Install Python and the locked dev tools (hashes in uv.lock)
+        id: sync
+        run: uv sync --locked
+      - name: ruff check
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run --locked ruff check . ../prototype ../bots
+      - name: ruff format
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run --locked ruff format --check . ../prototype ../bots
+      - name: mypy (strict)
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run --locked mypy
+      - name: unit tests
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run --locked pytest
+
+  # The dispatcher's match spec through the real controller, and the controller's result.json
+  # read back by the dispatcher: the two languages can't drift apart unnoticed.
+  contract:
+    name: contract
+    needs: changes
+    if: needs.changes.outputs.platform == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: platform
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust version from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: Install pinned uv
+        run: ../.github/scripts/install-tool.sh uv
+      - name: Build the mock controller
+        run: cargo build --locked -p mock-controller
+      - name: Contract tests
+        working-directory: platform/dispatcher
+        env:
+          CONTROLLER_BIN: ${{ github.workspace }}/platform/target/debug/mock-controller
+        run: |
+          test -x "$CONTROLLER_BIN" # without it the tests would only be skipped
+          uv sync --locked
+          uv run --locked pytest -m contract
+
+  ci-result:
+    name: ci-result
+    needs: [changes, fmt, validate, tflint, iac-scan, workflow-lint, plan, comment, rust, minimum-rust, python, contract]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Summarise
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_FORK: ${{ needs.changes.outputs.is_fork }}
+          RELEVANT: ${{ needs.changes.outputs.infra == 'true' || needs.changes.outputs.workflows == 'true' }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          bad=$(jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key' <<<"$NEEDS")
+          if [[ -n "$bad" ]]; then
+            echo "::error::These jobs failed or were cancelled: $(echo "$bad" | paste -sd, -)"
+            exit 1
+          fi
+          if [[ "$(jq -r .changes.result <<<"$NEEDS")" != success ]]; then
+            echo "::error::The changes job did not succeed."
+            exit 1
+          fi
+          if [[ "$IS_FORK" == true && "$RELEVANT" == true ]]; then
+            echo "::error::Plans don't run on forks; push the branch to this repo."
+            exit 1
+          fi
+          echo "All required checks passed (skipped jobs had nothing relevant to check)."

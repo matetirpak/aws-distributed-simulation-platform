@@ -1,0 +1,14 @@
+{
+  "account_id": "123456789012",
+  "repository": "OWNER/NAME",
+  "game_server": {
+    "repository": "OWNER/GAME",
+    "id": "1000001",
+    "owner_id": "2000002",
+    "subject_prefix": "repo:OWNER@2000002/GAME@1000001"
+  },
+  "cost_anomaly_monitor_id": "00000000-0000-0000-0000-000000000000",
+  "alert_recipients": [
+    "alerts@example.com"
+  ]
+}

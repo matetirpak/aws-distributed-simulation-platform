@@ -1,0 +1,38 @@
+# Plan every environment on main, in order. An environment with "auto_apply": true in its
+# ci.json (dev) applies a plan that destroys, replaces and forgets nothing right here, after
+# the merge gate; everything else waits for an approver to run apply.yml
+# (docs/ci-cd.md).
+name: deploy
+
+on:
+  # Every push, deliberately without a paths filter: apply.yml only accepts a
+  # plan made for the current main HEAD, so a docs-only merge would otherwise
+  # leave a pending change with no usable plan. A no-op
+  # plan is cheap and simply closes the awaiting-approval issue.
+  push:
+    branches: [main]
+  # Re-run after a stale plan, or to plan again without a new commit.
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  dev:
+    name: dev
+    # Only once dev's AWS account is configured (repository variable INFRA_DEV, docs/ci-cd.md).
+    if: vars.INFRA_DEV != ''
+    uses: ./.github/workflows/_terraform-env.yml
+    with:
+      environment: dev
+    permissions:
+      contents: read
+      id-token: write # plan job (read-only plan role) and auto-apply job (apply role)
+      actions: read # auto-apply merge gate: the last apply.yml run
+      checks: read # auto-apply merge gate: ci-result of the merged PRs
+      deployments: write # auto-apply merge gate reads the last apply; record-apply job writes it
+      pull-requests: write # comment job (no AWS access); the merge gate reads PRs
+      issues: write # awaiting-approval issue job (no AWS access)
+
+  # Adding prod: add a job like the one above with `needs: dev`, and set
+  # "apply_after": ["dev"] in infra/envs/prod/ci.json so prod can only be applied
+  # after dev was applied for the same commit (docs/ci-cd.md).

@@ -1,0 +1,47 @@
+# One local match: the game controller and two bots, each bot on its own internal network
+# with the controller and nothing else (no internet, no route to the other bot).
+# Start it through the local runner, which sets every variable below:
+#   cargo run -p local-runner -- coin ok ok
+
+services:
+  controller:
+    build: { context: ., target: controller }
+    # A real game's image (for example from a game's release workflow) via
+    # `local-runner --controller-image <ref>`; otherwise our mock, built here.
+    image: ${CONTROLLER_IMAGE:-dsim/controller:local}
+    environment:
+      MATCH_SPEC: ${MATCH_SPEC:?run this through the local runner}
+      MOCK_GAME: ${MOCK_GAME:?}
+    user: "${HOST_UID:?}:${HOST_GID:?}" # the output files belong to you
+    read_only: true
+    volumes:
+      - ${OUT_DIR:?}:/out
+    networks: [match0, match1]
+
+  bot0: &bot
+    build: { context: ., target: bot-python }
+    image: dsim/bot-python:local
+    environment:
+      CONTROLLER_ADDR: controller:9000
+      BOT_TOKEN: ${TOKEN0:?}
+      BOT_MODE: ${MODE0:-ok}
+    read_only: true
+    tmpfs: ["/tmp:size=64m"]
+    mem_limit: 512m
+    pids_limit: 64
+    cpus: 1.0
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [match0]
+
+  bot1:
+    <<: *bot
+    environment:
+      CONTROLLER_ADDR: controller:9000
+      BOT_TOKEN: ${TOKEN1:?}
+      BOT_MODE: ${MODE1:-ok}
+    networks: [match1]
+
+networks:
+  match0: { internal: true }
+  match1: { internal: true }

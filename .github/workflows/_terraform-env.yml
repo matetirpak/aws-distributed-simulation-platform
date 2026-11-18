@@ -1,0 +1,434 @@
+# Reusable: plan one environment on main, then apply it or publish it for approval.
+#
+# Approval mode "degraded" (no environment reviewers for private repos below Enterprise,
+# see docs/ci-cd.md):
+#   - "auto_apply": true in ci.json, and the plan only creates, updates or reads: the
+#     auto-apply job applies this run's saved plan right away, after the merge gate.
+#   - Otherwise (destroy, replace or forget, a refused merge gate, or auto_apply off, as
+#     for prod): a human approves by running apply.yml with this run's ID.
+# The apply role trusts this file on main for the auto path (infra/bootstrap, auto_apply).
+# In mode A an `apply` job with `environment: <env>` replaces both (see "Switching modes").
+name: terraform-env
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Environment folder under infra/envs/
+        type: string
+        required: true
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Same group as apply.yml and drift.yml: plans and applies for one
+    # environment never overlap, and a running apply is never cancelled.
+    concurrency:
+      group: terraform-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token to assume the read-only plan role
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+      auto_safe: ${{ steps.plan.outputs.auto_safe }}
+      auto_apply: ${{ steps.cfg.outputs.auto_apply }}
+      plan_sha256: ${{ steps.package.outputs.plan_sha256 }}
+    steps:
+      - name: Only main may deploy
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::deploy only runs from main (this run is on $GITHUB_REF)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read ci.json
+        id: cfg
+        env:
+          TF_ENV: ${{ inputs.environment }}
+          CI_VARS: ${{ toJSON(vars) }}
+        run: .github/scripts/read-ci-config.sh "$TF_ENV" plan_role_arn
+
+      - uses: ./.github/actions/setup-terraform
+
+      - name: Assume the read-only plan role
+        id: creds
+        # A failure here must still produce a ❌ comment/summary: tf-plan.sh
+        # renders it, and the last step fails the job.
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+          allowed-account-ids: ${{ steps.cfg.outputs.account }}
+          role-session-name: gha-deploy-plan-${{ github.run_id }}
+
+      - name: terraform plan
+        id: plan
+        env:
+          TF_ENV: ${{ inputs.environment }}
+          OUT_DIR: ${{ runner.temp }}/plan
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MARKER_NAME: terraform-deploy
+          ASSUME_ROLE_OUTCOME: ${{ steps.creds.outcome }}
+          PLAN_ROLE: ${{ steps.cfg.outputs.role }}
+        run: .github/scripts/tf-plan.sh
+
+      - name: Package the saved plan
+        id: package
+        env:
+          OUT_DIR: ${{ runner.temp }}/plan
+        run: |
+          cd "$OUT_DIR"
+          if [[ -f tfplan ]]; then
+            sha256sum tfplan >tfplan.sha256
+            echo "plan_sha256=$(cut -d' ' -f1 tfplan.sha256)" >>"$GITHUB_OUTPUT"
+          fi
+          echo "$GITHUB_SHA" >commit.txt
+
+      - name: Write plan and approval instructions to the job summary
+        env:
+          OUT_DIR: ${{ runner.temp }}/plan
+          TF_ENV: ${{ inputs.environment }}
+          HAS_CHANGES: ${{ steps.plan.outputs.has_changes }}
+          AUTO: ${{ steps.cfg.outputs.auto_apply == 'true' && steps.plan.outputs.auto_safe == 'true' }}
+          PLAN_SHA256: ${{ steps.package.outputs.plan_sha256 }}
+        run: |
+          cat "$OUT_DIR/summary.md" >>"$GITHUB_STEP_SUMMARY"
+          if [[ "$HAS_CHANGES" == true && "$AUTO" == true ]]; then
+            {
+              echo
+              echo "### Applied automatically"
+              echo "This plan destroys, replaces and forgets nothing, so the auto-apply job applies it after the merge gate (auto_apply in ci.json)."
+            } >>"$GITHUB_STEP_SUMMARY"
+          elif [[ "$HAS_CHANGES" == true ]]; then
+            {
+              echo
+              echo "### Approve this plan"
+              echo "Nothing is applied until an approver runs:"
+              echo '```bash'
+              echo "gh workflow run apply.yml --ref main -f environment=$TF_ENV -f plan_run_id=$GITHUB_RUN_ID"
+              echo '```'
+              echo "or **Actions → apply → Run workflow** (branch \`main\`, environment \`$TF_ENV\`, plan_run_id \`$GITHUB_RUN_ID\`)."
+              echo
+              echo "Plan file SHA-256: \`$PLAN_SHA256\` (the apply run verifies it)."
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The saved plan contains the configuration and possibly sensitive values in
+      # plain text. Anyone with read access to the repo can download artifacts;
+      # retention is kept at one day.
+      - name: Upload the saved plan
+        if: steps.plan.outputs.exitcode == '0' || steps.plan.outputs.exitcode == '2'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: |
+            ${{ runner.temp }}/plan/tfplan
+            ${{ runner.temp }}/plan/tfplan.sha256
+            ${{ runner.temp }}/plan/commit.txt
+            ${{ runner.temp }}/plan/exitcode
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload the rendered comment
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deploy-comment-${{ inputs.environment }}
+          path: ${{ runner.temp }}/plan/comment.md
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Fail if the plan failed
+        env:
+          EXITCODE: ${{ steps.plan.outputs.exitcode }}
+        run: |
+          if [[ "$EXITCODE" != 0 && "$EXITCODE" != 2 ]]; then
+            echo "::error::terraform plan failed (exit code $EXITCODE). See the job summary."
+            exit 1
+          fi
+
+  # Applies this run's saved plan without an approver: only with "auto_apply": true in
+  # ci.json and a plan that destroys, replaces and forgets nothing (the job's if:). The
+  # pre-flight runs the merge gate; where a human is needed it skips, and the plan waits
+  # for apply.yml as before (docs/ci-cd.md).
+  auto-apply:
+    name: auto-apply
+    needs: plan
+    if: needs.plan.outputs.has_changes == 'true' && needs.plan.outputs.auto_apply == 'true' && needs.plan.outputs.auto_safe == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: terraform-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read # merge gate: the last apply.yml run, before the first deployment record
+      checks: read # merge gate: ci-result of the merged PRs
+      pull-requests: read # merge gate: the PRs and their reviews
+      deployments: read # merge gate: the last applied commit
+      id-token: write # OIDC token to assume the apply role
+    outputs:
+      skip: ${{ steps.preflight.outputs.skip }}
+      skip_kind: ${{ steps.preflight.outputs.skip_kind }}
+      reason: ${{ steps.preflight.outputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the merge gate walks main's history since the last apply
+          persist-credentials: false
+
+      - name: Pre-flight checks (auto)
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TF_ENV: ${{ inputs.environment }}
+          APPLY_MODE: auto
+          PLAN_RUN_ID: ${{ github.run_id }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: .github/scripts/apply-preflight.sh
+
+      - name: Download this run's plan
+        if: steps.preflight.outputs.skip != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ runner.temp }}/plan
+
+      - name: Verify the plan file
+        if: steps.preflight.outputs.skip != 'true'
+        env:
+          PLAN_DIR: ${{ runner.temp }}/plan
+          PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+        run: |
+          cd "$PLAN_DIR"
+          sha256sum --check --strict tfplan.sha256
+          if [[ "$(cut -d' ' -f1 tfplan.sha256)" != "$PLAN_SHA256" ]]; then
+            echo "::error::The plan file is not the one the plan job made."
+            exit 1
+          fi
+          if [[ "$(<commit.txt)" != "$GITHUB_SHA" || "$(<exitcode)" != 2 ]]; then
+            echo "::error::The plan was not made for ${GITHUB_SHA} with changes."
+            exit 1
+          fi
+          echo "Plan SHA-256 $PLAN_SHA256 verified for ${GITHUB_SHA:0:7}." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Read ci.json
+        if: steps.preflight.outputs.skip != 'true'
+        id: cfg
+        env:
+          TF_ENV: ${{ inputs.environment }}
+          CI_VARS: ${{ toJSON(vars) }}
+        run: .github/scripts/read-ci-config.sh "$TF_ENV" apply_role_arn
+
+      - if: steps.preflight.outputs.skip != 'true'
+        uses: ./.github/actions/setup-terraform
+
+      - name: Assume the apply role
+        if: steps.preflight.outputs.skip != 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+          allowed-account-ids: ${{ steps.cfg.outputs.account }}
+          role-session-name: gha-auto-apply-${{ github.run_id }}
+
+      - name: terraform apply (exactly the saved plan)
+        if: steps.preflight.outputs.skip != 'true'
+        env:
+          TF_ENV: ${{ inputs.environment }}
+          PLAN_DIR: ${{ runner.temp }}/plan
+        run: .github/scripts/tf-apply.sh
+
+      - name: Write the result to the job summary
+        if: always() && steps.preflight.outputs.skip != 'true'
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### Apply: $JOB_STATUS"
+            if [[ -f "$RUNNER_TEMP/apply.log" ]]; then
+              echo '```'
+              tail -n 30 "$RUNNER_TEMP/apply.log"
+              echo '```'
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  # The merge gate of the next apply starts from this record. Without AWS credentials,
+  # like the comment jobs. A failed record only makes the next gate check more commits.
+  record-apply:
+    name: record the apply
+    needs: auto-apply
+    if: needs.auto-apply.result == 'success' && needs.auto-apply.outputs.skip != 'true'
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      deployments: write # record a deployment of this commit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Record the deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TF_ENV: ${{ inputs.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: .github/scripts/record-apply.sh "$TF_ENV" "$GITHUB_SHA" "$RUN_URL"
+
+  approval-issue:
+    name: awaiting-approval issue
+    needs: [plan, auto-apply]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    # Nice to have, like the PR comment: it must not fail the deploy run.
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write # open, update or close "Plan awaiting approval: <env>"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deploy-comment-${{ inputs.environment }}
+          path: ${{ runner.temp }}/approval
+
+      - name: Open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TF_ENV: ${{ inputs.environment }}
+          HAS_CHANGES: ${{ needs.plan.outputs.has_changes }}
+          AUTO_APPLY: ${{ needs.plan.outputs.auto_apply }}
+          AUTO_RESULT: ${{ needs.auto-apply.result }}
+          AUTO_SKIP_KIND: ${{ needs.auto-apply.outputs.skip_kind }}
+          AUTO_REASON: ${{ needs.auto-apply.outputs.reason }}
+          PLAN_MD: ${{ runner.temp }}/approval/comment.md
+        run: |
+          run_link="[deploy run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID)"
+          if [[ "$AUTO_RESULT" == success && -z "$AUTO_SKIP_KIND" ]]; then
+            .github/scripts/approval-issue.sh close "$TF_ENV" \
+              "Applied automatically in $run_link (commit \`${GITHUB_SHA:0:7}\`): the plan destroyed, replaced and forgot nothing."
+          elif [[ "$AUTO_SKIP_KIND" == superseded || "$AUTO_RESULT" == cancelled ]]; then
+            echo "A newer run took over (newer commit, or its job replaced this one); it updates the issue."
+          elif [[ "$AUTO_RESULT" == failure ]]; then
+            echo "::warning::The automatic apply failed: see the auto-apply job. Fix forward with a new PR, or re-run deploy (docs/ci-cd.md)."
+          elif [[ "$HAS_CHANGES" == true ]]; then
+            reason=""
+            if [[ "$AUTO_APPLY" == true && -n "$AUTO_REASON" ]]; then
+              reason=$AUTO_REASON # the merge gate or apply_after needs a human
+            elif [[ "$AUTO_APPLY" == true && "$AUTO_RESULT" == skipped ]]; then
+              reason="The plan destroys, replaces or forgets resources, which always waits for an approver."
+            fi
+            .github/scripts/approval-issue.sh open "$TF_ENV" "$GITHUB_RUN_ID" "$GITHUB_SHA" "$PLAN_MD" "$reason"
+          else
+            .github/scripts/approval-issue.sh close "$TF_ENV" \
+              "The latest plan ([deploy run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID)) has no changes; nothing is waiting for approval."
+          fi
+
+  pr-comment:
+    name: comment on merged PR
+    needs: [plan, auto-apply]
+    if: ${{ !cancelled() && (needs.plan.result == 'success' || needs.plan.result == 'failure') }}
+    # Nice to have: a failed comment must not fail the deploy run, because
+    # apply.yml only accepts plans from successful deploy runs.
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write # comment the main plan on the PR that was merged
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deploy-comment-${{ inputs.environment }}
+          path: ${{ runner.temp }}/comment
+
+      - name: Comment the plan and how to approve it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TF_ENV: ${{ inputs.environment }}
+          HAS_CHANGES: ${{ needs.plan.outputs.has_changes }}
+          AUTO_APPLY: ${{ needs.plan.outputs.auto_apply }}
+          AUTO_RESULT: ${{ needs.auto-apply.result }}
+          AUTO_SKIP_KIND: ${{ needs.auto-apply.outputs.skip_kind }}
+          AUTO_REASON: ${{ needs.auto-apply.outputs.reason }}
+          COMMENT: ${{ runner.temp }}/comment/comment.md
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          source .github/scripts/gh-retry.sh
+          pr=$(gh_retry api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" |
+            jq -r '[.[] | select(.merged_at != null and .base.ref == "main")] | first | .number // empty')
+          if [[ -z "$pr" ]]; then
+            echo "::notice::${GITHUB_SHA:0:7} is not the result of a merged PR; nothing to comment on."
+            exit 0
+          fi
+          run_url="$SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          applied=""
+          if [[ "$HAS_CHANGES" != true ]]; then
+            :
+          elif [[ "$AUTO_RESULT" == success && -z "$AUTO_SKIP_KIND" ]]; then
+            applied=success
+            printf '\n**Applied automatically** in [this run](%s).\n' "$run_url" >>"$COMMENT"
+          elif [[ "$AUTO_SKIP_KIND" == superseded || "$AUTO_RESULT" == cancelled ]]; then
+            printf '\nA newer deploy run applies this change as well.\n' >>"$COMMENT"
+          elif [[ "$AUTO_RESULT" == failure ]]; then
+            applied=failure
+            printf '\n**The automatic apply failed** ([run](%s)). Fix forward with a new PR, or re-run deploy (docs/ci-cd.md).\n' "$run_url" >>"$COMMENT"
+          else
+            {
+              echo
+              if [[ "$AUTO_APPLY" == true && -n "$AUTO_REASON" ]]; then
+                echo "**Not applied automatically:** $AUTO_REASON"
+                echo
+              elif [[ "$AUTO_APPLY" == true && "$AUTO_RESULT" == skipped ]]; then
+                echo "**Not applied automatically:** the plan destroys, replaces or forgets resources, which always waits for an approver."
+                echo
+              fi
+              echo "**Approve to apply:** \`gh workflow run apply.yml --ref main -f environment=$TF_ENV -f plan_run_id=$GITHUB_RUN_ID\`"
+              echo "or [run the apply workflow]($SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/apply.yml) with plan_run_id \`$GITHUB_RUN_ID\`."
+            } >>"$COMMENT"
+          fi
+          .github/scripts/upsert-comment.sh "$pr" "$COMMENT"
+          if [[ -n "$applied" ]]; then
+            [[ "$TF_ENV" =~ ^[a-z0-9-]+$ ]] || exit 1
+            body="$RUNNER_TEMP/apply-comment.md"
+            if [[ "$applied" == success ]]; then icon="✅" text="Applied"; else icon="❌" text="Apply failed"; fi
+            {
+              echo "<!-- terraform-apply:$TF_ENV -->"
+              echo "### $icon $text: \`$TF_ENV\`"
+              echo
+              echo "Commit \`${GITHUB_SHA:0:7}\` · [deploy run]($run_url) · applied automatically after the merge"
+            } >"$body"
+            .github/scripts/upsert-comment.sh "$pr" "$body"
+          fi

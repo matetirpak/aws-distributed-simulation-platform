@@ -1,0 +1,53 @@
+{
+  "resource_changes": [
+    {
+      "address": "terraform_data.added",
+      "change": {
+        "actions": [
+          "create"
+        ]
+      }
+    },
+    {
+      "address": "terraform_data.changeme",
+      "change": {
+        "actions": [
+          "update"
+        ]
+      }
+    },
+    {
+      "address": "terraform_data.gone",
+      "change": {
+        "actions": [
+          "delete"
+        ]
+      }
+    },
+    {
+      "address": "terraform_data.keep",
+      "change": {
+        "actions": [
+          "no-op"
+        ]
+      }
+    },
+    {
+      "address": "terraform_data.replaceme",
+      "change": {
+        "actions": [
+          "delete",
+          "create"
+        ]
+      }
+    },
+    {
+      "address": "terraform_data.secret",
+      "change": {
+        "actions": [
+          "update"
+        ]
+      }
+    }
+  ]
+}

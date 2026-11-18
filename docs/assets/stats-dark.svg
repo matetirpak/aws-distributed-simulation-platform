@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 228" width="1000" height="228" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<rect x="0.5" y="0.5" width="999" height="227" rx="12" fill="#151b23" stroke="#3d444d"/>
+<line x1="20" y1="132" x2="980" y2="132" stroke="#3d444d"/>
+<text x="140.0" y="78" text-anchor="middle" font-size="44" font-weight="700" fill="#ff8a4c">1,000</text>
+<text x="140.0" y="108" text-anchor="middle" font-size="15" fill="#9198a1">matches completed in one batch</text>
+<text x="380.0" y="78" text-anchor="middle" font-size="44" font-weight="700" fill="#5cb0ff">2,000</text>
+<text x="380.0" y="108" text-anchor="middle" font-size="15" fill="#9198a1">bots, each on its own EC2 machine</text>
+<text x="620.0" y="78" text-anchor="middle" font-size="44" font-weight="700" fill="#ff8a4c">0</text>
+<text x="620.0" y="108" text-anchor="middle" font-size="15" fill="#9198a1">timeouts or invalid moves</text>
+<text x="860.0" y="78" text-anchor="middle" font-size="44" font-weight="700" fill="#5cb0ff">$12.20</text>
+<text x="860.0" y="108" text-anchor="middle" font-size="15" fill="#9198a1">for the whole batch</text>
+<text x="116.0" y="166" text-anchor="middle" font-size="24" font-weight="650" fill="#f0f6fc">161 s</text>
+<text x="116.0" y="190" text-anchor="middle" font-size="12.5" fill="#9198a1">average 10,000-turn match</text>
+<text x="308.0" y="166" text-anchor="middle" font-size="24" font-weight="650" fill="#f0f6fc">198 s</text>
+<text x="308.0" y="190" text-anchor="middle" font-size="12.5" fill="#9198a1">bot machines from zero to ready</text>
+<text x="500.0" y="166" text-anchor="middle" font-size="24" font-weight="650" fill="#f0f6fc">96%</text>
+<text x="500.0" y="190" text-anchor="middle" font-size="12.5" fill="#9198a1">of machines on Spot</text>
+<text x="692.0" y="166" text-anchor="middle" font-size="24" font-weight="650" fill="#f0f6fc">1</text>
+<text x="692.0" y="190" text-anchor="middle" font-size="12.5" fill="#9198a1">match replayed after a Spot reclaim</text>
+<text x="884.0" y="166" text-anchor="middle" font-size="24" font-weight="650" fill="#f0f6fc">10,000,000</text>
+<text x="884.0" y="190" text-anchor="middle" font-size="12.5" fill="#9198a1">turns played</text>
+</svg>

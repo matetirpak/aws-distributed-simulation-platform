@@ -1,0 +1,216 @@
+# The approval step. An approver runs this after reading the plan of a deploy run:
+#
+#   gh workflow run apply.yml --ref main -f environment=dev -f plan_run_id=<deploy run id>
+#
+# Only workflow_dispatch, never workflow_call: the apply role trusts this file on
+# main (job_workflow_ref). If it were callable, a branch workflow could call it
+# at @main and satisfy that condition.
+name: apply
+run-name: apply ${{ inputs.environment }} (plan run ${{ inputs.plan_run_id }})${{ inputs.acknowledge_unreviewed && ' with unreviewed changes acknowledged' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to apply
+        type: choice
+        options:
+          - dev
+        required: true
+      plan_run_id:
+        description: ID of the deploy run whose plan you approve
+        type: string
+        required: true
+      acknowledge_unreviewed:
+        description: I have read the unreviewed changes the pre-flight listed and still want to apply them
+        type: boolean
+        default: false
+
+permissions: {}
+
+# Apply runs for one environment queue (never cancelled). The apply job also
+# joins terraform-<env>, shared with deploy and drift plans.
+concurrency:
+  group: apply-${{ inputs.environment }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  refuse-non-main:
+    name: refuse (not main)
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - run: |
+          echo "::error::apply.yml only runs from main. Re-run it with --ref main."
+          exit 1
+
+  apply:
+    name: apply (${{ inputs.environment }})
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: terraform-${{ inputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read # read the deploy run and download its plan artifact
+      checks: read # merge gate: ci-result of the merged PR
+      pull-requests: read # merge gate: the PR and its reviews
+      deployments: read # merge gate: the last applied commit
+      id-token: write # OIDC token to assume the apply role
+    outputs:
+      pr_number: ${{ steps.preflight.outputs.pr_number }}
+      result: ${{ steps.result.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the merge gate walks main's history since the last apply
+          persist-credentials: false
+
+      - name: Pre-flight checks
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TF_ENV: ${{ inputs.environment }}
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          ACKNOWLEDGE_UNREVIEWED: ${{ inputs.acknowledge_unreviewed }}
+        run: .github/scripts/apply-preflight.sh
+
+      - name: Download the approved plan
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan-${{ inputs.environment }}
+          run-id: ${{ inputs.plan_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/plan
+          digest-mismatch: error
+
+      - name: Verify the plan file
+        env:
+          PLAN_DIR: ${{ runner.temp }}/plan
+        run: |
+          cd "$PLAN_DIR"
+          sha256sum --check --strict tfplan.sha256
+          if [[ "$(<commit.txt)" != "$GITHUB_SHA" ]]; then
+            echo "::error::The plan was made for $(<commit.txt), not ${GITHUB_SHA}."
+            exit 1
+          fi
+          if [[ "$(<exitcode)" != 2 ]]; then
+            echo "::error::That plan has no changes; there is nothing to apply."
+            exit 1
+          fi
+          echo "Plan SHA-256 $(cut -d' ' -f1 tfplan.sha256) verified for ${GITHUB_SHA:0:7}." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Read ci.json
+        id: cfg
+        env:
+          TF_ENV: ${{ inputs.environment }}
+          CI_VARS: ${{ toJSON(vars) }}
+        run: .github/scripts/read-ci-config.sh "$TF_ENV" apply_role_arn
+
+      - uses: ./.github/actions/setup-terraform
+
+      - name: Assume the apply role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.cfg.outputs.role }}
+          aws-region: ${{ steps.cfg.outputs.region }}
+          allowed-account-ids: ${{ steps.cfg.outputs.account }}
+          role-session-name: gha-apply-${{ github.run_id }}
+
+      - name: terraform apply (exactly the saved plan)
+        env:
+          TF_ENV: ${{ inputs.environment }}
+          PLAN_DIR: ${{ runner.temp }}/plan
+        run: .github/scripts/tf-apply.sh
+
+      - name: Record the result
+        id: result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          echo "result=$JOB_STATUS" >>"$GITHUB_OUTPUT"
+          {
+            echo "### Apply: $JOB_STATUS"
+            if [[ -f "$RUNNER_TEMP/apply.log" ]]; then
+              echo '```'
+              tail -n 30 "$RUNNER_TEMP/apply.log"
+              echo '```'
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: report result
+    needs: apply
+    if: ${{ !cancelled() && (needs.apply.outputs.pr_number != '' || needs.apply.outputs.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write # comment the apply result on the merged PR
+      issues: write # close "Plan awaiting approval: <env>" after a successful apply
+      deployments: write # record the apply; the next merge gate starts from it
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Comment ✅ or ❌
+        if: needs.apply.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TF_ENV: ${{ inputs.environment }}
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+          PR_NUMBER: ${{ needs.apply.outputs.pr_number }}
+          RESULT: ${{ needs.apply.outputs.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          [[ "$TF_ENV" =~ ^[a-z0-9-]+$ ]] || exit 1
+          body="$RUNNER_TEMP/apply-comment.md"
+          if [[ "$RESULT" == success ]]; then icon="✅" text="Applied"; else icon="❌" text="Apply failed"; fi
+          {
+            echo "<!-- terraform-apply:$TF_ENV -->"
+            echo "### $icon $text: \`$TF_ENV\`"
+            echo
+            echo "Commit \`${GITHUB_SHA:0:7}\` · plan from [deploy run $PLAN_RUN_ID]($SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$PLAN_RUN_ID) · [apply run]($RUN_URL) · approved by @$TRIGGERING_ACTOR"
+          } >"$body"
+          .github/scripts/upsert-comment.sh "$PR_NUMBER" "$body"
+
+      - name: Record the apply as a deployment
+        if: needs.apply.outputs.result == 'success'
+        # A failed record only makes the next merge gate check more commits.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TF_ENV: ${{ inputs.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: .github/scripts/record-apply.sh "$TF_ENV" "$GITHUB_SHA" "$RUN_URL"
+
+      - name: Close the awaiting-approval issue
+        if: needs.apply.outputs.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TF_ENV: ${{ inputs.environment }}
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          .github/scripts/approval-issue.sh close "$TF_ENV" \
+            "Applied the plan from deploy run $PLAN_RUN_ID (commit \`${GITHUB_SHA:0:7}\`) in [apply run]($RUN_URL), approved by @$TRIGGERING_ACTOR."

@@ -1,0 +1,9 @@
+/target
+# local match output: results, replays and the tokens of local matches
+/out
+# the dispatcher's environment and tool caches (uv, mypy, pytest, ruff)
+/dispatcher/.venv
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

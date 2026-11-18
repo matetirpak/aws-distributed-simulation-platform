@@ -1,0 +1,116 @@
+# Direct-push alarm. The main ruleset blocks direct and force pushes, but owners can
+# switch it off, so every push to main is still checked: if the new HEAD did not come from a merged pull
+# request (or history was force-pushed), open an issue and fail this run.
+# apply.yml's merge gate independently refuses to apply such a commit.
+name: main-guard
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: main-guard
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  provenance:
+    name: provenance
+    # The guard protects what the pipeline applies, so it runs once an AWS account is
+    # configured (an INFRA_<ENV> repository variable, docs/ci-cd.md).
+    if: contains(toJSON(vars), '"INFRA_')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # find the PR that produced the pushed commit
+      issues: write # open the "Unreviewed push to main" issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Check that main moved by merging a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          FORCED: ${{ github.event.forced }}
+          PUSHER: ${{ github.event.pusher.name }}
+          COMPARE_URL: ${{ github.event.compare }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          source .github/scripts/gh-retry.sh
+          pr=""
+          for attempt in 1 2 3; do
+            # A failing API call must not be mistaken for a direct push.
+            pulls=$(gh_retry api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls") ||
+              { echo "::error::Could not query GitHub for ${GITHUB_SHA:0:7}'s pull request. Re-run main-guard."; exit 1; }
+            pr=$(jq -r --arg sha "$GITHUB_SHA" '[.[] | select(.merged_at != null and .base.ref == "main" and .merge_commit_sha == $sha)] | first | .number // empty' <<<"$pulls")
+            [[ -n "$pr" ]] && break
+            sleep $((attempt * 5)) # the commit-to-PR association can lag a few seconds
+          done
+
+          if [[ -n "$pr" && "$FORCED" != true ]]; then
+            echo "${GITHUB_SHA:0:7} came from merged PR #$pr."
+            exit 0
+          fi
+
+          reason="was pushed to main without a merged pull request"
+          [[ "$FORCED" == true ]] && reason="was force-pushed to main (history rewritten)"
+          body="$RUNNER_TEMP/unreviewed.md"
+          {
+            echo "Commit \`$GITHUB_SHA\` $reason by @$PUSHER."
+            echo
+            echo "- Previous HEAD: \`$BEFORE\`"
+            echo "- Changes: $COMPARE_URL"
+            echo "- Detected by: $RUN_URL"
+            echo
+            echo "apply.yml will refuse to apply this commit (merge gate). Review it, then either undo it or"
+            echo "get the same change reviewed through a PR. Close this issue when resolved."
+            echo
+            echo "### How to undo it (through a reviewed PR)"
+            echo
+            if [[ "$FORCED" == true ]]; then
+              echo "History was rewritten, so restore the previous tree on top of the current main:"
+              echo '```bash'
+              echo "git fetch origin && git switch -c restore/main-${BEFORE:0:7} origin/main"
+              echo "git restore --source=$BEFORE --staged --worktree -- . && git commit -m \"Restore main to ${BEFORE:0:7} after force push\""
+              echo "git push -u origin restore/main-${BEFORE:0:7}   # then open a PR to main"
+              echo '```'
+            else
+              echo "Revert every commit of this push (\`${BEFORE:0:7}..${GITHUB_SHA:0:7}\`):"
+              echo '```bash'
+              echo "git fetch origin && git switch -c revert/${GITHUB_SHA:0:7} origin/main"
+              echo "git revert --no-edit $BEFORE..$GITHUB_SHA   # add -m 1 for merge commits"
+              echo "git push -u origin revert/${GITHUB_SHA:0:7}   # then open a PR to main"
+              echo '```'
+            fi
+            echo
+            echo "Don't force-push main to undo it. See docs/ci-cd.md."
+          } >"$body"
+          title="Unreviewed push to main: ${GITHUB_SHA:0:7}"
+          label_args=(--label unreviewed-push)
+          if ! label_exists unreviewed-push; then
+            echo "::warning::Label 'unreviewed-push' does not exist (create it, see docs/setup.md); opening the issue without it."
+            label_args=()
+          fi
+          # Find-then-create, retried as a whole, so a create that errored but went
+          # through isn't duplicated. A failed find fails the attempt rather than
+          # counting as "no issue yet".
+          # shellcheck disable=SC2329 # invoked indirectly via retry_step
+          open_issue() {
+            local found
+            found=$(gh_retry issue list --state open --limit 200 --json title --jq ".[] | select(.title == \"$title\") | .title") || return 1
+            [[ -z "$found" ]] || return 0
+            gh issue create --title "$title" "${label_args[@]}" --body-file "$body"
+          }
+          retry_step open_issue
+          echo "::error::${GITHUB_SHA:0:7} $reason."
+          exit 1

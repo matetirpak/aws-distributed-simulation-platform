@@ -1,0 +1,25 @@
+#!/bin/bash
+# User data of a bot machine (matches_bot_hosts.tf).
+cat >> /etc/ecs/ecs.config <<'CONFIG'
+ECS_CLUSTER=${cluster}
+ECS_AWSVPC_BLOCK_IMDS=true
+ECS_DISABLE_PRIVILEGED=true
+CONFIG
+
+cat > /usr/local/bin/one-bot <<'SCRIPT'
+${one_bot}
+SCRIPT
+chmod 755 /usr/local/bin/one-bot
+
+cat > /etc/systemd/system/one-bot.service <<'UNIT'
+[Unit]
+Description=Terminate this machine after its first ECS task
+After=ecs.service
+
+[Service]
+ExecStart=/usr/local/bin/one-bot
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl enable --now --no-block one-bot.service

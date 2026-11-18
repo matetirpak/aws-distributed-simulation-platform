@@ -1,0 +1,11 @@
+# Python outside the dispatcher (which has its own settings in dispatcher/pyproject.toml): the
+# prototype's runner and match task, and the bots. CI checks them with the dispatcher's locked Ruff.
+line-length = 100
+target-version = "py313"
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[lint.isort]
+# The match task's own module, imported from next to it (prototype/task/).
+known-first-party = ["bot_tasks"]

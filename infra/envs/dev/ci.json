@@ -1,0 +1,9 @@
+{
+  "aws_region": "eu-central-1",
+  "approver_ids": [
+    194424313
+  ],
+  "apply_after": [],
+  "allow_self_review": true,
+  "auto_apply": true
+}

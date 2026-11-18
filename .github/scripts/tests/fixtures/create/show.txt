@@ -1,0 +1,25 @@
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+
+Terraform will perform the following actions:
+
+  # terraform_data.alpha will be created
+  + resource "terraform_data" "alpha" {
+      + id     = (known after apply)
+      + input  = "a"
+      + output = (known after apply)
+    }
+
+  # terraform_data.beta will be created
+  + resource "terraform_data" "beta" {
+      + id     = (known after apply)
+      + input  = {
+          + name = "b"
+          + size = 2
+        }
+      + output = (known after apply)
+    }
+
+Plan: 2 to add, 0 to change, 0 to destroy.

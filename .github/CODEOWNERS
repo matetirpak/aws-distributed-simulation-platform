@@ -1,0 +1,6 @@
+# Changes to these paths alter the pipeline's security boundary, the AWS trust anchors, or,
+# because dev applies automatically after a merge, AWS itself (docs/ci-cd.md).
+/.github/            @matetirpak
+/infra/              @matetirpak
+/.terraform-version  @matetirpak
+/.tflint.hcl         @matetirpak

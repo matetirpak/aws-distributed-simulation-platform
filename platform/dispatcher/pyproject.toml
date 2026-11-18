@@ -1,0 +1,48 @@
+[project]
+name = "dispatcher"
+version = "0.1.0"
+description = "Turns match requests into running matches and reports their results"
+requires-python = ">=3.13"
+# The core and the local backend use only the standard library. The AWS adapters (boto3)
+# come with the execution account.
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.7", "mypy>=1.13"]
+
+[tool.uv]
+# An application, not a library: nothing is built or installed, so no build backend is
+# downloaded outside uv.lock. Run from this directory: `uv run python -m dispatcher ...`.
+package = false
+# Resolve only releases at least a week old (our supply-chain rule; the window in which
+# poisoned releases are usually caught). To update: move the date to 7 days ago, then
+# `uv lock --upgrade` and review the diff. This uv needs an absolute date.
+exclude-newer = "2026-10-09T00:00:00Z"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+# The docker end-to-end test is slow and needs Docker: run it with `pytest -m docker`.
+addopts = "-m 'not docker' --strict-markers"
+markers = [
+  "docker: plays real matches with docker compose (run locally)",
+  "contract: runs the real controller binary (needs CONTROLLER_BIN)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "PT"]
+ignore = [
+  "S603", # subprocess without shell: the local backend runs `docker compose` with fixed arguments
+  "S607", # `docker` from PATH, like the local runner
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"] # assert is how pytest checks
+
+[tool.mypy]
+strict = true
+files = ["dispatcher", "tests"]

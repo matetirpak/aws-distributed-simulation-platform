@@ -1,0 +1,10 @@
+# zizmor configuration. Every ignore here must carry its justification.
+rules:
+  # We reference our own composite action and reusable workflow with `./`.
+  # zizmor >= 1.30 prefers GitHub's self-repository syntax (`uses: $/...`, July
+  # 2026), but actionlint 1.7.12 (latest release) rejects `$/` as invalid, and
+  # both linters must pass. Every `./` action use here follows actions/checkout of
+  # the same commit, and `./` reusable-workflow calls resolve at the running
+  # commit, so behaviour is the same. Revisit once actionlint supports `$/`.
+  self-repository:
+    disable: true

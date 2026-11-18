@@ -1,0 +1,53 @@
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+  ~ update in-place
+  - destroy
+-/+ destroy and then create replacement
+
+Terraform will perform the following actions:
+
+  # terraform_data.added will be created
+  + resource "terraform_data" "added" {
+      + id     = (known after apply)
+      + input  = "fresh"
+      + output = (known after apply)
+    }
+
+  # terraform_data.changeme will be updated in-place
+  ~ resource "terraform_data" "changeme" {
+        id     = "00000000-0000-0000-0000-000000000008"
+      ~ input  = "old" -> "new"
+      ~ output = "old" -> (known after apply)
+    }
+
+  # terraform_data.gone will be destroyed
+  # (because terraform_data.gone is not in configuration)
+  - resource "terraform_data" "gone" {
+      - id     = "00000000-0000-0000-0000-000000000004" -> null
+      - input  = "bye" -> null
+      - output = "bye" -> null
+    }
+
+  # terraform_data.replaceme must be replaced
+-/+ resource "terraform_data" "replaceme" {
+      ~ id               = "00000000-0000-0000-0000-000000000009" -> (known after apply)
+      ~ output           = "r" -> (known after apply)
+      ~ triggers_replace = "v1" -> "v2"
+        # (1 unchanged attribute hidden)
+    }
+
+  # terraform_data.secret will be updated in-place
+  ~ resource "terraform_data" "secret" {
+        id     = "00000000-0000-0000-0000-000000000006"
+      # Warning: this attribute value will be marked as sensitive and will not
+      # display in UI output after applying this change.
+      ~ input  = (sensitive value)
+      ~ output = "old-secret" -> (known after apply)
+    }
+
+Plan: 2 to add, 2 to change, 2 to destroy.
+
+Changes to Outputs:
+  + greeting = "hello"
